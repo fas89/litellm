@@ -1363,6 +1363,7 @@ _ANTHROPIC_BETA_HEADERS_RELOAD_CONFIG: Final = TypeAdapter(_AnthropicBetaHeaders
 _LITELLM_PARAMS_COPY: Final = TypeAdapter(dict[str, object])
 _WEBSEARCH_INTERCEPTION_LITELLM_SETTINGS: Final = TypeAdapter(_WebsearchInterceptionLitellmSettings)
 _UNTYPED_VALUE: Final = TypeAdapter(object)
+_GENERAL_SETTINGS_FLAG: Final = TypeAdapter(bool)
 
 
 class _AiohttpConnectorKwargs(TypedDict, total=False):
@@ -2980,6 +2981,13 @@ _GENERAL_SETTINGS_VIEW: Final[TypeAdapter[Mapping[str, object]]] = TypeAdapter(M
 
 def general_settings_view() -> Mapping[str, object]:
     return _GENERAL_SETTINGS_VIEW.validate_python(general_settings)
+
+
+def general_settings_flag(name: str, *, fallback: bool) -> bool:
+    try:
+        return _GENERAL_SETTINGS_FLAG.validate_python(general_settings_view().get(name, False))
+    except ValidationError:
+        return fallback
 
 
 config_passthrough_endpoints: list[dict[str, object]] | None = None
@@ -12313,7 +12321,9 @@ async def model_list(
 
     settings: Final = cast(dict[str, object], general_settings)  # any-ok: legacy settings
     include_wildcard_routes: Final = (
-        return_wildcard_routes if return_wildcard_routes is not None else settings.get("return_wildcard_routes") is True
+        return_wildcard_routes
+        if return_wildcard_routes is not None
+        else general_settings_flag("return_wildcard_routes", fallback=False)
     )
 
     from litellm.llms.anthropic.common_utils import (

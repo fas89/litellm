@@ -13,7 +13,6 @@ from types import MappingProxyType
 from typing import Final, Protocol, TypeAlias
 
 from fastapi import HTTPException
-from pydantic import TypeAdapter, ValidationError
 
 from litellm._logging import verbose_logger
 from litellm.proxy._types import (
@@ -58,16 +57,10 @@ class AgentAccessLookup(Protocol):
     def __call__(self, user_api_key_auth: UserAPIKeyAuth | None, /, *, strict: bool) -> Awaitable[AgentAccess]: ...
 
 
-_DEFAULT_DENY_FLAG: Final = TypeAdapter(bool)
-
-
 def agent_access_default_deny() -> bool:
-    from litellm.proxy.proxy_server import general_settings_view
+    from litellm.proxy.proxy_server import general_settings_flag
 
-    try:
-        return _DEFAULT_DENY_FLAG.validate_python(general_settings_view().get("agent_access_default_deny", False))
-    except ValidationError:
-        return True
+    return general_settings_flag("agent_access_default_deny", fallback=True)
 
 
 def _is_proxy_admin(user_api_key_auth: UserAPIKeyAuth | None) -> bool:
