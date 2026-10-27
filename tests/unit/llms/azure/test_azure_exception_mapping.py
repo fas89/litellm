@@ -1,13 +1,23 @@
 import json
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Final
 from unittest.mock import MagicMock, patch
 
 import pytest
 import httpx
+import openai
 import respx
 
 
 import litellm
-from litellm.exceptions import ContentPolicyViolationError
+from litellm.exceptions import (
+    APIError,
+    BadRequestError,
+    ContentPolicyViolationError,
+    ContextWindowExceededError,
+    NotFoundError,
+    RateLimitError,
+)
 from litellm.litellm_core_utils.exception_mapping_utils import exception_type
 
 
@@ -490,3 +500,175 @@ class TestAzureExceptionMapping:
         error = exc_info.value
         assert "encrypted_content_affinity" in error.message
         assert "enable_pre_call_checks" in error.message
+
+
+_AZURE_API_BASE: Final = "https://azure-context.openai.azure.com"
+_AZURE_CALL_KWARGS: Final = {
+    "api_base": _AZURE_API_BASE,
+    "api_version": "2024-10-21",
+    "api_key": "test-azure-key",
+    "max_retries": 0,
+}
+
+
+def _azure_error_body(code: object, message: str) -> Mapping[str, object]:
+    return {"error": {"message": message, "type": "invalid_request_error", "param": "input", "code": code}}
+
+
+async def _azure_chat(*, stream: bool) -> None:
+    messages: Final = [{"role": "user", "content": "hi"}]
+    if stream:
+        stream_response: Final = await litellm.acompletion(
+            model="azure/gpt-4o", messages=messages, stream=True, **_AZURE_CALL_KWARGS
+        )
+        assert isinstance(stream_response, litellm.CustomStreamWrapper)
+        async for _chunk in stream_response:
+            pass
+    else:
+        litellm.completion(model="azure/gpt-4o", messages=messages, **_AZURE_CALL_KWARGS)
+
+
+async def _azure_responses(*, is_async: bool) -> None:
+    if is_async:
+        await litellm.aresponses(model="azure/gpt-4o", input="hi", **_AZURE_CALL_KWARGS)
+    else:
+        litellm.responses(model="azure/gpt-4o", input="hi", **_AZURE_CALL_KWARGS)
+
+
+async def _azure_embedding() -> None:
+    litellm.embedding(model="azure/text-embedding-3-small", input="hi", **_AZURE_CALL_KWARGS)
+
+
+_AZURE_CALLS: Final = (
+    pytest.param(lambda: _azure_chat(stream=False), id="chat"),
+    pytest.param(lambda: _azure_chat(stream=True), id="async-chat-stream"),
+    pytest.param(lambda: _azure_responses(is_async=False), id="responses"),
+    pytest.param(lambda: _azure_responses(is_async=True), id="async-responses"),
+    pytest.param(_azure_embedding, id="embedding"),
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", _AZURE_CALLS)
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        pytest.param(
+            _azure_error_body(
+                "context_length_exceeded",
+                "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            ),
+            ContextWindowExceededError,
+            id="code-with-other-message",
+        ),
+        pytest.param(
+            {"code": "context_length_exceeded", "message": "Too many tokens"},
+            ContextWindowExceededError,
+            id="unwrapped-body",
+        ),
+        pytest.param(
+            _azure_error_body("invalid_value", 'Invalid enum value "code": "context_length_exceeded"'),
+            BadRequestError,
+            id="message-only-quotes-code",
+        ),
+    ],
+)
+@respx.mock
+async def test_azure_400_is_classified_by_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+    call: Callable[[], Awaitable[None]],
+    body: Mapping[str, object],
+    expected: type[Exception],
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    route: Final = respx.post(url__startswith=_AZURE_API_BASE).mock(return_value=httpx.Response(400, json=body))
+
+    with pytest.raises(BadRequestError) as exc_info:
+        await call()
+
+    assert type(exc_info.value) is expected
+    assert len(route.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("call", _AZURE_CALLS)
+@respx.mock
+async def test_azure_context_window_error_keeps_upstream_code_and_param(
+    monkeypatch: pytest.MonkeyPatch, call: Callable[[], Awaitable[None]]
+) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    respx.post(url__startswith=_AZURE_API_BASE).mock(
+        return_value=httpx.Response(400, json=_azure_error_body("context_length_exceeded", "Too many tokens"))
+    )
+
+    with pytest.raises(ContextWindowExceededError) as exc_info:
+        await call()
+
+    assert exc_info.value.code == "context_length_exceeded"
+    assert exc_info.value.param == "input"
+
+
+@pytest.mark.asyncio
+@respx.mock
+async def test_azure_context_length_code_triggers_context_window_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(litellm, "disable_aiohttp_transport", True)
+    route: Final = respx.post(url__startswith=_AZURE_API_BASE).mock(
+        return_value=httpx.Response(
+            400,
+            json=_azure_error_body(
+                "context_length_exceeded",
+                "Your input exceeds the context window of this model. Please adjust your input and try again.",
+            ),
+        )
+    )
+    router: Final = litellm.Router(
+        model_list=[
+            {"model_name": "small", "litellm_params": {"model": "azure/gpt-4o", **_AZURE_CALL_KWARGS}},
+            {"model_name": "large", "litellm_params": {"model": "gpt-4.1", "mock_response": "served by large"}},
+        ],
+        context_window_fallbacks=[{"small": ["large"]}],
+        num_retries=0,
+    )
+
+    response: Final = await router.acompletion(  # pyright: ignore[reportUnknownMemberType]  # untyped **kwargs
+        model="small", messages=[{"role": "user", "content": "hi"}]
+    )
+
+    assert isinstance(response, litellm.ModelResponse)
+    assert response.choices[0].message.content == "served by large"
+    assert len(route.calls) == 1
+
+
+_CONTEXT_LENGTH_EXCEEDED_BODY: Final = _azure_error_body("context_length_exceeded", "Too many tokens")
+
+
+def _azure_status_error(status_code: int, message: str, body: object) -> openai.APIStatusError:
+    return openai.APIStatusError(
+        message, response=httpx.Response(status_code, request=httpx.Request("POST", _AZURE_API_BASE)), body=body
+    )
+
+
+def test_azure_content_policy_inner_error_wins_over_context_length_code() -> None:
+    body: Final = {
+        "error": {
+            "message": "The response was filtered",
+            "type": "invalid_request_error",
+            "code": "context_length_exceeded",
+            "inner_error": {"code": "ResponsibleAIPolicyViolation"},
+        }
+    }
+    error: Final = _azure_status_error(400, f"Error code: 400 - {body}", body=body)
+
+    with pytest.raises(ContentPolicyViolationError):
+        exception_type(model="gpt-4o", original_exception=error, custom_llm_provider="azure")
+
+
+@pytest.mark.parametrize(("status_code", "expected"), [(404, NotFoundError), (429, RateLimitError), (500, APIError)])
+def test_azure_non_400_with_context_length_code_keeps_its_class(status_code: int, expected: type[Exception]) -> None:
+    message: Final = f"Error code: {status_code} - {json.dumps(_CONTEXT_LENGTH_EXCEEDED_BODY)}"
+    error: Final = _azure_status_error(status_code, message, body=_CONTEXT_LENGTH_EXCEEDED_BODY)
+
+    with pytest.raises(expected) as exc_info:
+        exception_type(model="gpt-4o", original_exception=error, custom_llm_provider="azure")
+
+    assert type(exc_info.value) is expected

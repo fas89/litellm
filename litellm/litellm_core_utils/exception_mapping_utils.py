@@ -273,18 +273,23 @@ class _ProviderHTTPException(Protocol):
 _ERROR_BODY_ADAPTER: Final = TypeAdapter(dict[str, object])
 
 
-def _openai_cyber_policy_body(original_exception: _ProviderHTTPException) -> Mapping[str, object] | None:
-    raw_body: Final[object] = getattr(original_exception, "body", None)
+def _provider_error_object(raw_body: object, error_text: str) -> Mapping[str, object] | None:
     try:
         body: Final = (
             _ERROR_BODY_ADAPTER.validate_python(raw_body)
             if raw_body is not None
-            else _ERROR_BODY_ADAPTER.validate_json(getattr(original_exception, "message", ""))
+            else _ERROR_BODY_ADAPTER.validate_json(error_text)
         )
-        error: Final = _ERROR_BODY_ADAPTER.validate_python(body.get("error", body))
+        return _ERROR_BODY_ADAPTER.validate_python(body.get("error", body))
     except ValidationError:
         return None
-    return error if error.get("code") == "cyber_policy" else None
+
+
+def _openai_cyber_policy_body(original_exception: _ProviderHTTPException) -> Mapping[str, object] | None:
+    error: Final = _provider_error_object(
+        getattr(original_exception, "body", None), getattr(original_exception, "message", "")
+    )
+    return error if error is not None and error.get("code") == "cyber_policy" else None
 
 
 def _litellm_proxy_response(
@@ -1989,6 +1994,13 @@ def _map_vllm_exception(
             )
 
 
+def _azure_context_length_error(
+    original_exception: _ProviderHTTPException, error_str: str
+) -> Mapping[str, object] | None:
+    error: Final = _provider_error_object(getattr(original_exception, "body", None), error_str)
+    return error if error is not None and error.get("code") == "context_length_exceeded" else None
+
+
 def _map_azure_exception(
     *,
     model: str,
@@ -2084,6 +2096,18 @@ def _map_azure_exception(
             litellm_debug_info=extra_information,
             response=getattr(original_exception, "response", None),
             body=getattr(original_exception, "body", None),
+        )
+    elif (
+        getattr(original_exception, "status_code", None) in (None, 400)
+        and (context_length_error := _azure_context_length_error(original_exception, error_str)) is not None
+    ):
+        raise ContextWindowExceededError(
+            message=f"AzureException ContextWindowExceededError - {message}",
+            llm_provider="azure",
+            model=model,
+            litellm_debug_info=extra_information,
+            response=getattr(original_exception, "response", None),
+            body=context_length_error,
         )
     elif "invalid_request_error" in error_str and getattr(original_exception, "status_code", None) in (None, 400):
         raise BadRequestError(
